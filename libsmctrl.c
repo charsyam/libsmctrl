@@ -1,150 +1,121 @@
 /**
- * Copyright 2023 Joshua Bakita
+ * Copyright 2022-2025 Joshua Bakita
  * Library to control SM masks on CUDA launches. Co-opts preexisting debug
  * logic in the CUDA driver library, and thus requires a build with -lcuda.
+ *
+ * This file implements partitioning via three different mechanisms:
+ * - Modifying the QMD/TMD immediately prior to upload
+ * - Changing a field in CUDA's stream struct that CUDA applies to the QMD/TMD
+ * This table shows the mechanism used with each CUDA version:
+ *   +-----------+---------------+---------------+--------------+
+ *   |  Version  |  Global Mask  |  Stream Mask  |  Next Mask   |
+ *   +-----------+---------------+---------------+--------------+
+ *   | 8.0-12.8  | TMD/QMD Hook  | stream struct | TMD/QMD Hook |
+ *   | 6.5-7.5   | TMD/QMD Hook  | N/A           | TMD/QMD Hook |
+ *   +-----------+---------------+---------------+--------------+
+ * "N/A" indicates that a mask type is unsupported on that CUDA version.
+ * Please contact the authors if support is needed for a particular feature on
+ * an older CUDA version. Support for those is unimplemented, not impossible.
+ *
+ * An old implementation of this file effected the global mask on CUDA 10.2 by
+ * changing a field in CUDA's global struct that CUDA applies to the QMD/TMD.
+ * That implementation was extraordinarily complicated, and was replaced in
+ * 2024 with a more-backward-compatible way of hooking the TMD/QMD.
+ * View the old implementation via Git: `git show aa63a02e:libsmctrl.c`.
  */
 #include <cuda.h>
 
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+
+#include "libsmctrl.h"
 
 // In functions that do not return an error code, we favor terminating with an
 // error rather than merely printing a warning and continuing.
 #define abort(ret, errno, ...) error_at_line(ret, errno, __FILE__, __LINE__, \
                                              __VA_ARGS__)
 
-// Layout of mask control fields to match CUDA's static global struct
-struct global_sm_control {
-	uint32_t enabled;
-	uint64_t mask;
-} __attribute__((packed));
+/*** QMD/TMD-based SM Mask Control via Debug Callback. ***/
 
-// /*** CUDA Globals Manipulation. CUDA 10.2 only ***/
-
-// // Ends up being 0x7fb7fa3408 in some binaries (CUDA 10.2, Jetson)
-// static struct global_sm_control* g_sm_control = NULL;
-
-// /* Find the location of CUDA's `globals` struct and the SM mask control fields
-//  * No symbols are exported from within `globals`, so this has to do a very
-//  * messy lookup, following the pattern of the assembly of `cuDeviceGetCount()`.
-//  * Don't call this before the CUDA library has been initialized.
-//  * (Note that this appears to work, even if built on CUDA > 10.2.)
-//  */
-// static void setup_g_sm_control_10() {
-// 	if (g_sm_control)
-// 		return;
-// 	// The location of the static global struct containing the global SM
-// 	// mask field will vary depending on where the loader locates the CUDA
-// 	// library. In order to reliably modify this struct, we must defeat
-// 	// that relocation by deriving its location relative to a known
-// 	// reference point.
-// 	//
-// 	// == Choosing a Reference Point:
-// 	// The cudbg* symbols appear to be relocated to a constant offset from
-// 	// the globals structure, and so we use the address of the symbol
-// 	// `cudbgReportDriverApiErrorFlags` as our reference point. (This ends
-// 	// up being the closest to an intermediate table we use as part of our
-// 	// lookup---process discussed below.)
-// 	extern uint32_t cudbgReportDriverApiErrorFlags;
-// 	uint32_t* sym = &cudbgReportDriverApiErrorFlags;
-
-// 	// == Deriving Location:
-// 	// The number of CUDA devices available is co-located in the same CUDA
-// 	// globals structure that we aim to modify the SM mask field in. The
-// 	// value in that field can be assigned to a user-controlled pointer via
-// 	// the cuDeviceGetCount() CUDA Driver Library function. To determine
-// 	// the location of thu structure, we pass a bad address to the function
-// 	// and dissasemble the code adjacent to where it segfaults. On the
-// 	// Jetson Xavier with CUDA 10.2, the assembly is as follows:
-//         //   (reg x19 contains cuDeviceGetCount()'s user-provided pointer)
-// 	//   ...
-// 	//   0x0000007fb71454b4:  cbz   x19, 0x7fb71454d0 // Check ptr non-zero
-// 	//   0x0000007fb71454b8:  adrp  x1, 0x7fb7ea6000 // Addr of lookup tbl
-// 	//   0x0000007fb71454bc:  ldr   x1, [x1,#3672] // Get addr of globals
-// 	//   0x0000007fb71454c0:  ldr   w1, [x1,#904] // Get count from globals
-// 	//   0x0000007fb71454c4:  str   w1, [x19] // Store count at user addr
-// 	//   ...
-// 	// In this assembly, we can identify that CUDA uses an internal lookup
-// 	// table to identify the location of the globals structure (pointer
-// 	// 459 in the table; offset 3672). After obtaining this pointer, it
-// 	// advances to offset 904 in the global structure, dereferences the
-// 	// value stored there, and then attempts to store it at the user-
-// 	// -provided address (register x19). This final line will trigger a
-// 	// segfault if a non-zero bad address is passed to cuDeviceGetCount().
-// 	//
-// 	// On x86_64:
-// 	//   (reg %rbx contains cuDeviceGetCount()'s user-provided pointer)
-// 	//   ...
-// 	//   0x00007ffff6cac01f:  test  %rbx,%rbx // Check ptr non-zero
-// 	//   0x00007ffff6cac022:  je    0x7ffff6cac038 // ''
-// 	//   0x00007ffff6cac024:  mov   0x100451d(%rip),%rdx # 0x7ffff7cb0548 // Get globals base address from offset from instruction pointer
-// 	//   0x00007ffff6cac02b:  mov   0x308(%rdx),%edx // Take globals base address, add an offset of 776, and dereference
-// 	//   0x00007ffff6cac031:  mov   %edx,(%rbx) // Store count at user addr
-// 	//   ...
-// 	// Note that this does not use an intermediate lookup table.
-// 	//
-// 	// [Aside: cudbgReportDriverApiErrorFlags is currently the closest
-// 	// symbol to **the lookup table**. cudbgDebuggerInitialized is closer
-// 	// to the globals struct itself (+7424 == SM mask control), but we
-// 	// perfer the table lookup approach for now, as that's what
-// 	// cuDeviceGetCount() does.]
-
-// #if __aarch64__
-// 	// In my test binary, the lookup table is at address 0x7fb7ea6000, and
-// 	// this is 1029868 bytes before the address for
-// 	// cudbgReportDriverApiErrorFlags. Use this information to derive the
-// 	// location of the lookup in our binary (defeat relocation).
-// 	uintptr_t* tbl_base = (uintptr_t*)((uintptr_t)sym - 1029868);
-// 	// Address of `globals` is at offset 3672 (entry 459?) in the table
-// 	uintptr_t globals_addr = *(tbl_base + 459);
-// 	// SM mask control is at offset 4888 in the `globals` struct
-// 	// [Device count at offset 904 (0x388)]
-// 	g_sm_control = (struct global_sm_control*)(globals_addr + 4888);
-// #endif // __aarch64__
-// #if __x86_64__
-// 	// In my test binary, globals is at 0x7ffff7cb0548, which is 1103576
-// 	// bytes before the address for cudbgReportDriverApiErrorFlags
-// 	// (0x7ffff7dbdc20). Use this offset to defeat relocation.
-// 	uintptr_t globals_addr = *(uintptr_t*)((uintptr_t)sym - 1103576);
-// 	// SM mask control is at offset 4728 in the `globals` struct
-// 	// [Device count at offset 776 (0x308)]
-// 	g_sm_control = (struct global_sm_control*)(globals_addr + 4728);
-// #endif // __x86_64__
-// 	// SM mask should be empty by default
-// 	if (g_sm_control->enabled || g_sm_control->mask)
-// 		fprintf(stderr, "Warning: Found non-empty SM disable mask "
-// 		                "during setup! libsmctrl_set_global_mask() is "
-// 		                "unlikely to work on this platform!\n");
-// }
-
-/*** QMD/TMD-based SM Mask Control via Debug Callback. CUDA 11+ ***/
-
-// Tested working on CUDA x86_64 11.0-12.2.
-// Tested not working on aarch64 or x86_64 10.2
+// Tested working on x86_64 CUDA 6.5, 9.1, and various 10+ versions
+// (No testing attempted on pre-CUDA-6.5 versions)
+// Values for the following three lines can be extracted by tracing CUPTI as
+// it interects with libcuda.so to set callbacks.
 static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b};
-#define LAUNCH_DOMAIN 0x3
-#define LAUNCH_PRE_UPLOAD 0x3
+// These callback descriptors appear to intercept the TMD/QMD late enough that
+// CUDA has already applied the per-stream mask from its internal data
+// structures, allowing us to override it with the next mask.
+#define QMD_DOMAIN 0xb
+#define QMD_PRE_UPLOAD 0x1
+// Global mask (applies across all threads)
 static uint64_t g_sm_mask = 0;
+// Next mask (applies per-thread)
 static __thread uint64_t g_next_sm_mask = 0;
-static char sm_control_setup_called = 0;
-static void launchCallback(void *ukwn, int domain, int cbid, const void *in_params) {
-	if (*(uint32_t*)in_params < 0x50) {
-		fprintf(stderr, "Unsupported CUDA version for callback-based SM masking. Aborting...\n");
-		return;
+// Flag value to indicate if setup has been completed
+static bool sm_control_setup_called = false;
+
+// v1 has been removed---it intercepted the TMD/QMD too early, making it
+// impossible to override the CUDA-injected stream mask with the next mask.
+static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in_params) {
+	// ***Only tested on platforms with 64-bit pointers.***
+	// The first 8-byte element in `in_params` appears to be its size. `in_params`
+	// must have at least five 8-byte elements for index four to be valid.
+	if (*(uint32_t*)in_params < 5 * sizeof(void*))
+		abort(1, 0, "Unsupported CUDA version for callback-based SM masking. Aborting...");
+	// The fourth 8-byte element in `in_params` is a pointer to the TMD. Note
+	// that this fourth pointer must exist---it only exists when the first
+	// 8-byte element of `in_params` is at least 0x28 (checked above).
+	void* tmd = *((void**)in_params + 4);
+	if (!tmd)
+		abort(1, 0, "TMD allocation appears NULL; likely forward-compatibilty issue.\n");
+
+	uint32_t *lower_ptr, *upper_ptr;
+
+	// The TMD version field location varies by QMD generation.
+	// V01_06 through V04_00: version at byte 72
+	// V05_00 (Blackwell):    version at byte 58
+	uint8_t tmd_ver = *(uint8_t*)(tmd + 72);
+
+	// If byte 72 is zero, check byte 58 for Blackwell V05_00+
+	if (tmd_ver == 0)
+		tmd_ver = *(uint8_t*)(tmd + 58);
+
+	if (tmd_ver >= 0x50) {
+		// QMD V05_00 is used on Blackwell (sm_12x)
+		// TPC_DISABLE_MASK at byte 280-292, enable bit at byte 16 bit 31
+		lower_ptr = tmd + 280;
+		upper_ptr = tmd + 284;
+		// Disable upper 64 TPCs
+		*(uint32_t*)(tmd + 288) = -1;
+		*(uint32_t*)(tmd + 292) = -1;
+		// TPC_DISABLE_MASK_VALID enable bit (bit 159 = DW4 bit 31)
+		*(uint32_t*)(tmd + 16) |= 0x80000000;
+	} else if (tmd_ver >= 0x40) {
+		// TMD V04_00 is used starting with Hopper to support masking >64 TPCs
+		lower_ptr = tmd + 304;
+		upper_ptr = tmd + 308;
+		// XXX: Disable upper 64 TPCs until we have ...next_mask_ext and
+		//      ...global_mask_ext
+		*(uint32_t*)(tmd + 312) = -1;
+		*(uint32_t*)(tmd + 316) = -1;
+		// An enable bit is also required
+		*(uint32_t*)tmd |= 0x80000000;
+	} else if (tmd_ver >= 0x16) {
+		// TMD V01_06 is used starting with Kepler V2, and is the first to
+		// support TPC masking
+		lower_ptr = tmd + 84;
+		upper_ptr = tmd + 88;
+	} else {
+		// TMD V00_06 is documented to not support SM masking
+		abort(1, 0, "TMD version %04o is too old! This GPU does not support SM masking.\n", tmd_ver);
 	}
-	if (!**((uintptr_t***)in_params+8)) {
-		fprintf(stderr, "Called with NULL halLaunchDataAllocation\n");
-		return;
-	}
-	//fprintf(stderr, "cta: %lx\n", *(uint64_t*)(**((char***)in_params + 8) + 74));
-	// TODO: Check for supported QMD version (>XXX, <4.00)
-	// TODO: Support QMD version 4 (Hopper), where offset starts at +304 (rather than +84) and is 72 bytes (rather than 8 bytes) wide
-	uint32_t *lower_ptr = (uint32_t*)(**((char***)in_params + 8) + 84);
-	uint32_t *upper_ptr = (uint32_t*)(**((char***)in_params + 8) + 88);
+
+	// Setting the next mask overrides both per-stream and global masks
 	if (g_next_sm_mask) {
 		*lower_ptr = (uint32_t)g_next_sm_mask;
 		*upper_ptr = (uint32_t)(g_next_sm_mask >> 32);
@@ -154,87 +125,131 @@ static void launchCallback(void *ukwn, int domain, int cbid, const void *in_para
 		*lower_ptr = (uint32_t)g_sm_mask;
 		*upper_ptr = (uint32_t)(g_sm_mask >> 32);
 	}
-	//fprintf(stderr, "lower mask: %x\n", *lower_ptr);
-	//fprintf(stderr, "upper mask: %x\n", *upper_ptr);
+
+	//fprintf(stderr, "Final SM Mask (lower): %x\n", *lower_ptr);
+	//fprintf(stderr, "Final SM Mask (upper): %x\n", *upper_ptr);
 }
 
-static void setup_sm_control_11() {
+static void setup_sm_control_callback() {
 	int (*subscribe)(uint32_t* hndl, void(*callback)(void*, int, int, const void*), void* ukwn);
 	int (*enable)(uint32_t enable, uint32_t hndl, int domain, int cbid);
 	uintptr_t* tbl_base;
 	uint32_t my_hndl;
-	// Avoid race conditions (setup can only be called once)
+	// Avoid race conditions (setup should only run once)
 	if (__atomic_test_and_set(&sm_control_setup_called, __ATOMIC_SEQ_CST))
 		return;
 
+#if CUDA_VERSION <= 6050
+	// Verify supported CUDA version
+	// It's impossible for us to run with a version of CUDA older than we were
+	// built by, so this check is excluded if built with CUDA > 6.5.
+	int ver = 0;
+	cuDriverGetVersion(&ver);
+	if (ver < 6050)
+		abort(1, ENOSYS, "Global or next masking requires at least CUDA 6.5; "
+		                 "this application is using CUDA %d.%d",
+		                 ver / 1000, (ver % 100));
+#endif
+
+	// Set up callback
 	cuGetExportTable((const void**)&tbl_base, &callback_funcs_id);
 	uintptr_t subscribe_func_addr = *(tbl_base + 3);
 	uintptr_t enable_func_addr = *(tbl_base + 6);
 	subscribe = (typeof(subscribe))subscribe_func_addr;
 	enable = (typeof(enable))enable_func_addr;
 	int res = 0;
-	res = subscribe(&my_hndl, launchCallback, NULL);
-	if (res) {
-		fprintf(stderr, "libsmctrl: Error subscribing to launch callback. Error %d\n", res);
-		return;
-	}
-	res = enable(1, my_hndl, LAUNCH_DOMAIN, LAUNCH_PRE_UPLOAD);
+	res = subscribe(&my_hndl, control_callback_v2, NULL);
 	if (res)
-		fprintf(stderr, "libsmctrl: Error enabling launch callback. Error %d\n", res);
+		abort(1, 0, "Error subscribing to launch callback. CUDA returned error code %d.", res);
+	res = enable(1, my_hndl, QMD_DOMAIN, QMD_PRE_UPLOAD);
+	if (res)
+		abort(1, 0, "Error enabling launch callback. CUDA returned error code %d.", res);
 }
 
 // Set default mask for all launches
 void libsmctrl_set_global_mask(uint64_t mask) {
-	int ver;
-	cuDriverGetVersion(&ver);
-	if (ver == 10020) {
-		// if (!g_sm_control)
-		// 	setup_g_sm_control_10();
-		// g_sm_control->mask = mask;
-		// g_sm_control->enabled = 1;
-	} else if (ver > 10020) {
-		if (!sm_control_setup_called)
-			setup_sm_control_11();
-		g_sm_mask = mask;
-	} else { // < CUDA 10.2
-		abort(1, ENOSYS, "Global masking requires at least CUDA 10.2; "
-		                 "this application is using CUDA %d.%d",
-		                 ver / 1000, (ver % 100));
-	}
+	setup_sm_control_callback();
+	g_sm_mask = mask;
 }
 
 // Set mask for next launch from this thread
 void libsmctrl_set_next_mask(uint64_t mask) {
-	if (!sm_control_setup_called)
-		setup_sm_control_11();
+	setup_sm_control_callback();
 	g_next_sm_mask = mask;
 }
 
 
 /*** Per-Stream SM Mask (unlikely to be forward-compatible) ***/
 
+// Offsets for the stream struct on x86_64
+// No offset appears to work with CUDA 6.5 (tried 0x0--0x1b4 w/ 4-byte step)
+// 6.5 tested on 340.118
 #define CU_8_0_MASK_OFF 0xec
 #define CU_9_0_MASK_OFF 0x130
-#define CU_9_0_MASK_OFF_TX2 0x128 // CUDA 9.0 is slightly different on the TX2
 // CUDA 9.0 and 9.1 use the same offset
+// 9.1 tested on 390.157
 #define CU_9_2_MASK_OFF 0x140
-#define CU_10_0_MASK_OFF 0x24c
+#define CU_10_0_MASK_OFF 0x244
 // CUDA 10.0, 10.1 and 10.2 use the same offset
+// 10.1 tested on 418.113
+// 10.2 tested on 440.100, 440.82, 440.64, and 440.36
 #define CU_11_0_MASK_OFF 0x274
 #define CU_11_1_MASK_OFF 0x2c4
 #define CU_11_2_MASK_OFF 0x37c
 // CUDA 11.2, 11.3, 11.4, and 11.5 use the same offset
+// 11.4 tested on 470.223.02
 #define CU_11_6_MASK_OFF 0x38c
 #define CU_11_7_MASK_OFF 0x3c4
 #define CU_11_8_MASK_OFF 0x47c
+// 11.8 tested on 520.56.06
 #define CU_12_0_MASK_OFF 0x4cc
 // CUDA 12.0 and 12.1 use the same offset
+// 12.0 tested on 525.147.05
+#define CU_12_2_MASK_OFF 0x4e4
+// 12.2 tested on 535.129.03
+#define CU_12_3_MASK_OFF 0x49c
+// 12.3 tested on 545.29.06
+#define CU_12_4_MASK_OFF 0x4ac
+// 12.4 tested on 550.54.14 and 550.54.15
+#define CU_12_5_MASK_OFF 0x4ec
+// CUDA 12.5 and 12.6 use the same offset
+// 12.5 tested on 555.58.02
+// 12.6 tested on 560.35.03
+#define CU_12_7_MASK_OFF 0x4fc
+// CUDA 12.7 and 12.8 use the same offset
+// 12.7 tested on 565.77
+// 12.8 tested on 570.124.06
 
-// Layout in CUDA's `stream` struct
+// Offsets for the stream struct on Jetson aarch64
+#define CU_9_0_MASK_OFF_JETSON 0x128
+// 9.0 tested on Jetpack 3.x (TX2, Nov 2023)
+#define CU_10_2_MASK_OFF_JETSON 0x24c
+// 10.2 tested on Jetpack 4.x (AGX Xaver and TX2, Nov 2023)
+#define CU_11_4_MASK_OFF_JETSON 0x394
+// 11.4 tested on Jetpack 5.x (AGX Orin, Nov 2023)
+// TODO: 11.8, 12.0, 12.1, and 12.2 on Jetpack 5.x via compatibility packages
+#define CU_12_2_MASK_OFF_JETSON 0x50c
+// 12.2 tested on Jetpack 6.x (AGX Orin, Dec 2024)
+#define CU_12_4_MASK_OFF_JETSON 0x4c4
+// 12.4 tested on Jetpack 6.x with cuda-compat-12-4 (AGX Orin, Dec 2024)
+#define CU_12_5_MASK_OFF_JETSON 0x50c
+// 12.5 tested on Jetpack 6.x with cuda-compat-12-5 (AGX Orin, Dec 2024)
+#define CU_12_6_MASK_OFF_JETSON 0x514
+// 12.6 tested on Jetpack 6.x with cuda-compat-12-6 (AGX Orin, Dec 2024)
+#define CU_13_0_MASK_OFF_JETSON 0x53c
+// 13.0 tested on DGX Spark GB10 with driver 580.95.05 (Mar 2026)
+
+// Used up through CUDA 11.8 in the stream struct
 struct stream_sm_mask {
 	uint32_t upper;
 	uint32_t lower;
-} __attribute__((packed));
+};
+
+// Used starting with CUDA 12.0 in the stream struct
+struct stream_sm_mask_v2 {
+	uint32_t enabled;
+	uint32_t mask[4];
+};
 
 // Check if this system has a Parker SoC (TX2/PX2 chip)
 // (CUDA 9.0 behaves slightly different on this platform.)
@@ -264,36 +279,30 @@ int detect_parker_soc() {
 }
 #endif // __aarch64__
 
-// Should work for CUDA 8.0 through 12.1
+// Should work for CUDA 8.0 through 12.6
 // A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
 // our header
 void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
+	// When the old API is used on GPUs with over 64 TPCs, disable all TPCs >64
+	uint128_t full_mask = -1;
+	full_mask <<= 64;
+	full_mask |= mask;
+	libsmctrl_set_stream_mask_ext(stream, full_mask);
+}
+
+void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask) {
 	char* stream_struct_base = *(char**)stream;
-	struct stream_sm_mask* hw_mask;
+	struct stream_sm_mask* hw_mask = NULL;
+	struct stream_sm_mask_v2* hw_mask_v2 = NULL;
 	int ver;
 	cuDriverGetVersion(&ver);
 	switch (ver) {
+#if __x86_64__
 	case 8000:
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_8_0_MASK_OFF);
 	case 9000:
 	case 9010: {
 		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_0_MASK_OFF);
-#if __aarch64__
-		// Jetson TX2 offset is slightly different on CUDA 9.0.
-		// Only compile the check into ARM64 builds.
-		int is_parker;
-		const char* err_str;
-		if ((is_parker = detect_parker_soc()) < 0) {
-			cuGetErrorName(-is_parker, &err_str);
-			fprintf(stderr, "libsmctrl_set_stream_mask: CUDA call "
-					"failed while doing compatibilty test."
-			                "Error, '%s'. Not applying stream "
-					"mask.\n", err_str);
-		}
-
-		if (is_parker)
-			hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_0_MASK_OFF_TX2);
-#endif
 		break;
 	}
 	case 9020:
@@ -327,26 +336,95 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 		break;
 	case 12000:
 	case 12010:
-	case 12020:
-		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_12_0_MASK_OFF);
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_0_MASK_OFF);
 		break;
-	default: {
-		// For experimenting to determine the right mask offset, set the MASK_OFF
-		// environment variable (positive and negative numbers are supported)
-		char* mask_off_str = getenv("MASK_OFF");
-		fprintf(stderr, "libsmctrl: Stream masking unsupported on this CUDA version (%d)!\n", ver);
-		if (mask_off_str) {
-			int off = atoi(mask_off_str);
-			fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA 12.1 base %#x "
-					"(total off: %#x)\n", off, CU_12_0_MASK_OFF, CU_12_0_MASK_OFF+off);
-			hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_12_0_MASK_OFF + off);
-		} else {
-			return;
-		}}
+	case 12020:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_2_MASK_OFF);
+		break;
+	case 12030:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_3_MASK_OFF);
+		break;
+	case 12040:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_4_MASK_OFF);
+		break;
+	case 12050:
+	case 12060:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_5_MASK_OFF);
+		break;
+	case 12070:
+	case 12080:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_7_MASK_OFF);
+		break;
+#elif __aarch64__
+	case 9000: {
+		// Jetson TX2 offset is slightly different on CUDA 9.0.
+		// Only compile the check into ARM64 builds.
+		// TODO: Always verify Jetson-board-only on aarch64.
+		int is_parker;
+		const char* err_str;
+		if ((is_parker = detect_parker_soc()) < 0) {
+			cuGetErrorName(-is_parker, &err_str);
+			abort(1, 0, "While performing platform-specific "
+			            "compatibility checks for stream masking, "
+			            "CUDA call failed with error '%s'.", err_str);
+		}
+
+		if (!is_parker)
+			abort(1, 0, "Not supported on non-Jetson aarch64.");
+		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_9_0_MASK_OFF_JETSON);
+		break;
+	}
+	case 10020:
+		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_10_2_MASK_OFF_JETSON);
+		break;
+	case 11040:
+		hw_mask = (struct stream_sm_mask*)(stream_struct_base + CU_11_4_MASK_OFF_JETSON);
+		break;
+	case 12020:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_2_MASK_OFF_JETSON);
+		break;
+	case 12040:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_4_MASK_OFF_JETSON);
+		break;
+	case 12050:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_5_MASK_OFF_JETSON);
+		break;
+	case 12060:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_6_MASK_OFF_JETSON);
+		break;
+	case 13000:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_13_0_MASK_OFF_JETSON);
+		break;
+#endif
 	}
 
-	hw_mask->upper = mask >> 32;
-	hw_mask->lower = mask;
+	// For experimenting to determine the right mask offset, set the MASK_OFF
+	// environment variable (positive and negative numbers are supported)
+	char* mask_off_str = getenv("MASK_OFF");
+	if (mask_off_str) {
+		int off = atoi(mask_off_str);
+		fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA 12.2 base %#x "
+				"(total off: %#x)\n", off, CU_12_2_MASK_OFF, CU_12_2_MASK_OFF + off);
+		if (CU_12_2_MASK_OFF + off < 0)
+			abort(1, 0, "Total offset cannot be less than 0! Aborting...");
+		// +4 bytes to convert a mask found with this for use with hw_mask
+		hw_mask_v2 = (void*)(stream_struct_base + CU_12_2_MASK_OFF + off);
+	}
+
+	// Mask layout changed with CUDA 12.0 to support large Hopper/Ada GPUs
+	if (hw_mask) {
+		hw_mask->upper = mask >> 32;
+		hw_mask->lower = mask;
+	} else if (hw_mask_v2) {
+		hw_mask_v2->enabled = 1;
+		hw_mask_v2->mask[0] = mask;
+		hw_mask_v2->mask[1] = mask >> 32;
+		hw_mask_v2->mask[2] = mask >> 64;
+		hw_mask_v2->mask[3] = mask >> 96;
+	} else {
+		abort(1, 0, "Stream masking unsupported on this CUDA version (%d), and"
+		            " no fallback MASK_OFF set!", ver);
+	}
 }
 
 /* INFORMATIONAL FUNCTIONS */
@@ -354,16 +432,20 @@ void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
 // Read an integer from a file in `/proc`
 static int read_int_procfile(char* filename, uint64_t* out) {
 	char f_data[18] = {0};
+	size_t ret;
 	int fd = open(filename, O_RDONLY);
 	if (fd == -1)
 		return errno;
-	read(fd, f_data, 18);
+	ret = read(fd, f_data, 18);
+	if (ret == -1)
+		return errno;
 	close(fd);
 	*out = strtoll(f_data, NULL, 16);
 	return 0;
 }
 
-// We support up to 12 GPCs per GPU, and up to 16 GPUs.
+// We support up to 64 TPCs, up to 12 GPCs per GPU, and up to 16 GPUs.
+// TODO: Handle GPUs with greater than 64 TPCs (e.g. some H100 variants)
 static uint64_t tpc_mask_per_gpc_per_dev[16][12];
 // Output mask is vtpc-indexed (virtual TPC)
 int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev) {
@@ -452,9 +534,8 @@ int libsmctrl_get_tpc_info_cuda(uint32_t* num_tpcs, int cuda_dev) {
 		sms_per_tpc = 2;
 	else
 		sms_per_tpc = 1;
-	// It looks like there may be some upcoming weirdness (TPCs with only one SM?)
-	// with Hopper
-	if (major >= 9)
+	// Hopper (sm_9x) is untested; Blackwell (sm_10x, sm_12x) is verified.
+	if (major == 9)
 		fprintf(stderr, "libsmctrl: WARNING, TPC masking is untested on Hopper,"
 				" and will likely yield incorrect results! Proceed with caution.\n");
 	*num_tpcs = num_sms/sms_per_tpc;
