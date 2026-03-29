@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "libsmctrl.h"
@@ -70,7 +71,7 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 	// The fourth 8-byte element in `in_params` is a pointer to the TMD. Note
 	// that this fourth pointer must exist---it only exists when the first
 	// 8-byte element of `in_params` is at least 0x28 (checked above).
-	void* tmd = *((void**)in_params + 4);
+	char* tmd = (char*)*((void**)in_params + 4);
 	if (!tmd)
 		abort(1, 0, "TMD allocation appears NULL; likely forward-compatibilty issue.\n");
 
@@ -88,8 +89,8 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 	if (tmd_ver >= 0x50) {
 		// QMD V05_00 is used on Blackwell (sm_12x)
 		// TPC_DISABLE_MASK at byte 280-292, enable bit at byte 16 bit 31
-		lower_ptr = tmd + 280;
-		upper_ptr = tmd + 284;
+		lower_ptr = (uint32_t*)(tmd + 280);
+		upper_ptr = (uint32_t*)(tmd + 284);
 		// Disable upper 64 TPCs
 		*(uint32_t*)(tmd + 288) = -1;
 		*(uint32_t*)(tmd + 292) = -1;
@@ -97,8 +98,8 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 		*(uint32_t*)(tmd + 16) |= 0x80000000;
 	} else if (tmd_ver >= 0x40) {
 		// TMD V04_00 is used starting with Hopper to support masking >64 TPCs
-		lower_ptr = tmd + 304;
-		upper_ptr = tmd + 308;
+		lower_ptr = (uint32_t*)(tmd + 304);
+		upper_ptr = (uint32_t*)(tmd + 308);
 		// XXX: Disable upper 64 TPCs until we have ...next_mask_ext and
 		//      ...global_mask_ext
 		*(uint32_t*)(tmd + 312) = -1;
@@ -108,8 +109,8 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 	} else if (tmd_ver >= 0x16) {
 		// TMD V01_06 is used starting with Kepler V2, and is the first to
 		// support TPC masking
-		lower_ptr = tmd + 84;
-		upper_ptr = tmd + 88;
+		lower_ptr = (uint32_t*)(tmd + 84);
+		upper_ptr = (uint32_t*)(tmd + 88);
 	} else {
 		// TMD V00_06 is documented to not support SM masking
 		abort(1, 0, "TMD version %04o is too old! This GPU does not support SM masking.\n", tmd_ver);
@@ -403,12 +404,18 @@ void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask) {
 	char* mask_off_str = getenv("MASK_OFF");
 	if (mask_off_str) {
 		int off = atoi(mask_off_str);
-		fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA 12.2 base %#x "
-				"(total off: %#x)\n", off, CU_12_2_MASK_OFF, CU_12_2_MASK_OFF + off);
-		if (CU_12_2_MASK_OFF + off < 0)
+		// Use the current version's base offset if one was matched, else
+		// fall back to CU_12_2_MASK_OFF as a reasonable default.
+		int base_off = hw_mask_v2 ? (int)((char*)hw_mask_v2 - stream_struct_base)
+		             : hw_mask    ? (int)((char*)hw_mask - stream_struct_base)
+		             :              CU_12_2_MASK_OFF;
+		fprintf(stderr, "libsmctrl: Attempting offset %d on CUDA %d.%d base %#x "
+				"(total off: %#x)\n", off, ver / 1000, (ver % 100),
+				base_off, base_off + off);
+		if (base_off + off < 0)
 			abort(1, 0, "Total offset cannot be less than 0! Aborting...");
-		// +4 bytes to convert a mask found with this for use with hw_mask
-		hw_mask_v2 = (void*)(stream_struct_base + CU_12_2_MASK_OFF + off);
+		hw_mask_v2 = (void*)(stream_struct_base + base_off + off);
+		hw_mask = NULL;
 	}
 
 	// Mask layout changed with CUDA 12.0 to support large Hopper/Ada GPUs

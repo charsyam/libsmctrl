@@ -15,19 +15,19 @@ typedef unsigned __int128 uint128_t;
 
 // Set global default TPC mask for all kernels, incl. CUDA-internal ones
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 6.5 - CUDA 12.6
+// Supported: CUDA 6.5 - CUDA 13.0
 extern void libsmctrl_set_global_mask(uint64_t mask);
 // Set default TPC mask for all kernels launched via `stream`
 // (overrides global mask)
 // @param stream A cudaStream_t (aka CUstream_st*) to apply the mask on
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 8.0 - CUDA 12.6
+// Supported: CUDA 8.0 - CUDA 13.0
 extern void libsmctrl_set_stream_mask(void* stream, uint64_t mask);
 extern void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask);
 // Set TPC mask for the next kernel launch from the caller's CPU thread
 // (overrides global and per-stream masks, applies only to next launch).
 // @param mask   A bitmask of enabled/disabled TPCs (see Notes on Bitmasks)
-// Supported: CUDA 6.5 - CUDA 12.6
+// Supported: CUDA 6.5 - CUDA 13.0
 extern void libsmctrl_set_next_mask(uint64_t mask);
 
 /**
