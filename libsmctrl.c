@@ -220,6 +220,9 @@ void libsmctrl_set_next_mask(uint64_t mask) {
 // CUDA 12.7 and 12.8 use the same offset
 // 12.7 tested on 565.77
 // 12.8 tested on 570.124.06
+#define CU_13_0_MASK_OFF 0x51c
+// 13.0 validated on x86_64 with driver 580.65.06
+// (observed on RTX 4070 Laptop GPU)
 
 // Offsets for the stream struct on Jetson aarch64
 #define CU_9_0_MASK_OFF_JETSON 0x128
@@ -280,7 +283,7 @@ int detect_parker_soc() {
 }
 #endif // __aarch64__
 
-// Should work for CUDA 8.0 through 12.6
+// Should work for CUDA 8.0 through 13.0
 // A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
 // our header
 void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
@@ -355,6 +358,9 @@ void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask) {
 	case 12070:
 	case 12080:
 		hw_mask_v2 = (void*)(stream_struct_base + CU_12_7_MASK_OFF);
+		break;
+	case 13000:
+		hw_mask_v2 = (void*)(stream_struct_base + CU_13_0_MASK_OFF);
 		break;
 #elif __aarch64__
 	case 9000: {
@@ -552,4 +558,3 @@ abort_cuda:
 	fprintf(stderr, "libsmctrl: CUDA call failed due to %s. Failing with EIO...\n", err_str);
 	return EIO;
 }
-

@@ -47,6 +47,7 @@ Artifact from [Hardware Compute Partitioning on NVIDIA GPUs*
 | 12.4 | 0x4ac | 550.54.14, 550.54.15 |
 | 12.5 - 12.6 | 0x4ec | 555.58.02, 560.35.03 |
 | 12.7 - 12.8 | 0x4fc | 565.77, 570.124.06 |
+| 13.0 | 0x51c | 580.65.06 (validated on x86_64; observed on RTX 4070 Laptop GPU) |
 
 ### Stream Mask Offsets (aarch64 / Jetson)
 
